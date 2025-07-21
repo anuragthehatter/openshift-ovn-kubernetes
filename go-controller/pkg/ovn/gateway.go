@@ -273,7 +273,11 @@ func (gw *GatewayManager) createGWRouter(gwConfig *GatewayConfig) (*nbdb.Logical
 		// when it comes to SNATing traffic after load balancing.
 		// Hence for Layer2 UDPNs let's set the snat-ip explicitly to the
 		// joinsubnetIP
-		logicalRouterOptions["lb_force_snat_ip"] = strings.Join(util.IPNetsIPToStringSlice(gwConfig.gwRouterJoinCIDRs), " ")
+		joinIPDualStack := make([]string, len(gwConfig.gwLRPJoinIPs))
+		for i, gwLRPJoinIP := range gwConfig.gwLRPJoinIPs {
+			joinIPDualStack[i] = gwLRPJoinIP.IP.String()
+		}
+		logicalRouterOptions["lb_force_snat_ip"] = strings.Join(joinIPDualStack, " ")
 	}
 	physicalIPs := make([]string, len(gwConfig.annoConfig.IPAddresses))
 	for i, ip := range gwConfig.annoConfig.IPAddresses {
@@ -375,60 +379,13 @@ func (gw *GatewayManager) createGWRouterPeerSwitchPort(nodeName string) error {
 	return err
 }
 
-func (gw *GatewayManager) deleteGWRouterPeerSwitchPort() error {
-	// Remove the patch port that connects join switch to gateway router
-	lsp := nbdb.LogicalSwitchPort{Name: gw.getGWRouterPeerSwitchPortName()}
-	sw := nbdb.LogicalSwitch{Name: gw.joinSwitchName}
-	err := libovsdbops.DeleteLogicalSwitchPorts(gw.nbClient, &sw, &lsp)
-	if err != nil && !errors.Is(err, libovsdbclient.ErrNotFound) {
-		return fmt.Errorf("failed to delete logical switch port %s from switch %s: %w", lsp.Name, sw.Name, err)
-	}
-	return nil
-}
-
-func (gw *GatewayManager) createGWRouterPeerRouterPort() error {
-	gwPeerPortName := gw.getGWRouterPeerRouterPortName()
-	gwRouterPortName := gw.getGWRouterPortName()
-
-	ovnClusterRouterToGWRouterPort := nbdb.LogicalRouterPort{
-		Name:     gwPeerPortName,
-		MAC:      util.IPAddrToHWAddr(gw.transitRouterInfo.transitRouterNets[0].IP).String(),
-		Networks: util.IPNetsToStringSlice(gw.transitRouterInfo.transitRouterNets),
-		Options: map[string]string{
-			libovsdbops.RequestedTnlKey: fmt.Sprintf("%d", gw.transitRouterInfo.nodeID),
-		},
-		Peer: ptr.To(gwRouterPortName),
-		ExternalIDs: map[string]string{
-			types.NetworkExternalID:  gw.netInfo.GetNetworkName(),
-			types.TopologyExternalID: gw.netInfo.TopologyType(),
-		},
-	}
-
-	ovnClusterRouter := nbdb.LogicalRouter{Name: gw.clusterRouterName}
-	err := libovsdbops.CreateOrUpdateLogicalRouterPort(gw.nbClient, &ovnClusterRouter,
-		&ovnClusterRouterToGWRouterPort, nil, &ovnClusterRouterToGWRouterPort.MAC, &ovnClusterRouterToGWRouterPort.Networks,
-		&ovnClusterRouterToGWRouterPort.Options, &ovnClusterRouterToGWRouterPort.Peer, &ovnClusterRouterToGWRouterPort.ExternalIDs)
-	if err != nil {
-		return fmt.Errorf("failed to create port %+v on router %+v: %v", ovnClusterRouterToGWRouterPort, ovnClusterRouter, err)
-	}
-	return nil
-}
-
-func (gw *GatewayManager) deleteGWRouterPeerRouterPort() error {
-	ovnClusterRouterToGWRouterPort := nbdb.LogicalRouterPort{Name: gw.getGWRouterPeerRouterPortName()}
-	ovnClusterRouter := nbdb.LogicalRouter{Name: gw.clusterRouterName}
-	err := libovsdbops.DeleteLogicalRouterPorts(gw.nbClient, &ovnClusterRouter, &ovnClusterRouterToGWRouterPort)
-	if err != nil && !errors.Is(err, libovsdbclient.ErrNotFound) {
-		return fmt.Errorf("failed to delete router port %s from router %s: %w", ovnClusterRouterToGWRouterPort.Name, ovnClusterRouter.Name, err)
-	}
-	return nil
-}
-
 func (gw *GatewayManager) createGWRouterPort(gwConfig *GatewayConfig,
-	enableGatewayMTU bool, gwRouter *nbdb.LogicalRouter) error {
+	enableGatewayMTU bool, gwRouter *nbdb.LogicalRouter) ([]net.IP, error) {
+	gwLRPIPs := make([]net.IP, 0)
 	gwLRPNetworks := []string{}
-	for _, gwRouterJoinNet := range gwConfig.gwRouterJoinCIDRs {
-		gwLRPNetworks = append(gwLRPNetworks, gwRouterJoinNet.String())
+	for _, gwLRPJoinIP := range gwConfig.gwLRPJoinIPs {
+		gwLRPIPs = append(gwLRPIPs, gwLRPJoinIP.IP)
+		gwLRPNetworks = append(gwLRPNetworks, gwLRPJoinIP.String())
 	}
 	if gw.netInfo.TopologyType() == types.Layer2Topology && gw.transitRouterInfo == nil {
 		// At layer2 GR LRP acts as the layer3 ovn_cluster_router so we need
@@ -436,6 +393,7 @@ func (gw *GatewayManager) createGWRouterPort(gwConfig *GatewayConfig,
 		// one node per zone, since ARPs for .1 will not go beyond local switch.
 		// This is being done to add the ICMP SNATs for .1 podSubnet that OVN GR generates
 		for _, subnet := range gwConfig.hostSubnets {
+			gwLRPIPs = append(gwLRPIPs, gw.netInfo.GetNodeGatewayIP(subnet).IP)
 			gwLRPNetworks = append(gwLRPNetworks, gw.netInfo.GetNodeGatewayIP(subnet).String())
 		}
 	}
@@ -495,7 +453,6 @@ func (gw *GatewayManager) createGWRouterPort(gwConfig *GatewayConfig,
 func (gw *GatewayManager) updateGWRouterStaticRoutes(gwConfig *GatewayConfig, externalRouterPort string,
 	gwRouter *nbdb.LogicalRouter) error {
 	if len(gwConfig.ovnClusterLRPToJoinIfAddrs) > 0 {
-		// this is only the case for layer3 topology
 		for _, entry := range gwConfig.clusterSubnets {
 			drLRPIfAddr, err := util.MatchFirstIPNetFamily(utilnet.IsIPv6CIDR(entry), gwConfig.ovnClusterLRPToJoinIfAddrs)
 			if err != nil {
@@ -629,7 +586,7 @@ func (gw *GatewayManager) updateGWRouterStaticRoutes(gwConfig *GatewayConfig, ex
 	return nil
 }
 
-func (gw *GatewayManager) updateClusterRouterStaticRoutes(gwConfig *GatewayConfig, gwRouterIPs []net.IP) error {
+func (gw *GatewayManager) updateClusterRouterStaticRoutes(gwConfig *GatewayConfig, gwLRPIPs []net.IP) error {
 	// We need to add a route to the Gateway router's IP, on the
 	// cluster router, to ensure that the return traffic goes back
 	// to the same gateway router
@@ -685,7 +642,10 @@ func (gw *GatewayManager) updateClusterRouterStaticRoutes(gwConfig *GatewayConfi
 	// Add source IP address based routes in distributed router
 	// for this gateway router.
 	for _, hostSubnet := range gwConfig.hostSubnets {
-		nextHop, err := util.MatchIPFamily(utilnet.IsIPv6CIDR(hostSubnet), nextHops)
+		if gw.clusterRouterName == "" {
+			break
+		}
+		gwLRPIP, err := util.MatchIPFamily(utilnet.IsIPv6CIDR(hostSubnet), gwLRPIPs)
 		if err != nil {
 			return fmt.Errorf("failed to add source IP address based "+
 				"routes in distributed router %s: %v",
@@ -757,7 +717,7 @@ func (gw *GatewayManager) updateClusterRouterStaticRoutes(gwConfig *GatewayConfi
 // This function also updates SNAT created by `updateGWRouterNAT`, because NATs don't use ExternalIDs,
 // and their fields are used to find equivalent NATs. That means on gateway IPs change, instead of updating
 // the old NAT, we would create a new one. FIXME: add externalIDs to NATs
-func (gw *GatewayManager) syncNATsForGRIPChange(gwConfig *GatewayConfig, oldExtIPs, gwRouterIPs []net.IP,
+func (gw *GatewayManager) syncNATsForGRIPChange(gwConfig *GatewayConfig, oldExtIPs, gwLRPIPs []net.IP,
 	gwRouter, oldGWRouter *nbdb.LogicalRouter) error {
 	// if config.Gateway.DisabledSNATMultipleGWs is not set (by default it is not),
 	// the NAT rules for pods not having annotations to route through either external
@@ -968,7 +928,7 @@ func (gw *GatewayManager) gatewayInit(
 		return err
 	}
 
-	err = gw.createGWRouterPort(gwConfig, enableGatewayMTU, gwRouter)
+	gwLRPIPs, err := gw.createGWRouterPort(gwConfig, enableGatewayMTU, gwRouter)
 	if err != nil {
 		return err
 	}
@@ -1009,16 +969,15 @@ func (gw *GatewayManager) gatewayInit(
 		return err
 	}
 
-	gwRouterIPs := util.IPNetsToIPs(gwConfig.gwRouterJoinCIDRs)
-	if err = gw.updateClusterRouterStaticRoutes(gwConfig, gwRouterIPs); err != nil {
+	if err = gw.updateClusterRouterStaticRoutes(gwConfig, gwLRPIPs); err != nil {
 		return err
 	}
 
-	if err = gw.syncNATsForGRIPChange(gwConfig, oldExtIPs, gwRouterIPs, gwRouter, oldLogicalRouter); err != nil {
+	if err = gw.syncNATsForGRIPChange(gwConfig, oldExtIPs, gwLRPIPs, gwRouter, oldLogicalRouter); err != nil {
 		return err
 	}
 
-	if err = gw.updateGWRouterNAT(nodeName, gwConfig, gwRouterIPs, gwRouter); err != nil {
+	if err = gw.updateGWRouterNAT(nodeName, gwConfig, gwLRPIPs, gwRouter); err != nil {
 		return err
 	}
 
