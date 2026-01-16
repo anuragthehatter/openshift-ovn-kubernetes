@@ -42,8 +42,6 @@ var (
 			`Pod to external server PMTUD`,
 			`Pod to pod TCP with low MTU`,
 			`blocking ICMP needs frag`,
-			// UDN test requires egress
-			`pod2Egress on a user defined primary network`,
 			`is isolated from the default network`,
 			// requires host net port collision avoidance
 			`EndpointSlices mirroring`,
