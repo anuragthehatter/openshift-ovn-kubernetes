@@ -1,0 +1,53 @@
+package infraprovider
+
+import (
+	"fmt"
+
+	"github.com/ovn-org/ovn-kubernetes/test/e2e/infraprovider/api"
+)
+
+type openshiftNetwork struct {
+	name string
+	ipv4 *openshiftNetworkConfig
+	ipv6 *openshiftNetworkConfig
+}
+
+type openshiftNetworkConfig struct {
+	Subnet  string `json:"Subnet"`
+	Gateway string `json:"Gateway"`
+}
+
+func (n openshiftNetwork) Name() string {
+	return n.name
+}
+
+func (n openshiftNetwork) IPv4IPv6Subnets() (string, string, error) {
+	if n.ipv4 == nil && n.ipv6 == nil {
+		return "", "", fmt.Errorf("failed to get IPv4/IPv6 because network doesn't contain configuration")
+	}
+	var v4, v6 string
+	if n.ipv4 != nil {
+		if n.ipv4.Subnet == "" {
+			return "", "", fmt.Errorf("failed to get IPv4 because network %s contains a config with an empty subnet", n.Name())
+		}
+		v4 = n.ipv4.Subnet
+	}
+	if n.ipv6 != nil {
+		if n.ipv6.Subnet == "" {
+			return "", "", fmt.Errorf("failed to get IPv6 because network %s contains a config with an empty subnet", n.Name())
+		}
+		v6 = n.ipv6.Subnet
+	}
+	return v4, v6, nil
+}
+
+func (n openshiftNetwork) Equal(candidate api.Network) bool {
+	if n.name != candidate.Name() {
+		return false
+	}
+	return true
+}
+
+func (n openshiftNetwork) String() string {
+	return n.name
+}
